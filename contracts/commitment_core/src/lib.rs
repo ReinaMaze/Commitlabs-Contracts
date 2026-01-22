@@ -56,6 +56,8 @@ impl CommitmentCoreContract {
         asset_address: Address,
         rules: CommitmentRules,
     ) -> String {
+        owner.require_auth();
+        
         // Validate rules
         if amount <= 0 {
             panic!("amount must be positive");

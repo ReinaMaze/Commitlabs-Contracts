@@ -229,6 +229,14 @@ impl AttestationEngineContract {
         metrics.last_attestation = timestamp;
         e.storage().persistent().set(&(HEALTH_METRICS, commitment_id.clone()), &metrics);
     }
+
+    /// Set authorized verifier (admin only)
+    pub fn set_authorized_verifier(e: Env, verifier: Address) {
+        let admin: Address = e.storage().instance().get(&ADMIN).unwrap();
+        admin.require_auth();
+        // Store authorized verifier - using a simple storage key
+        e.storage().instance().set(&symbol_short!("AUTH_VERIF"), &verifier);
+    }
 }
 
 #[cfg(test)]
