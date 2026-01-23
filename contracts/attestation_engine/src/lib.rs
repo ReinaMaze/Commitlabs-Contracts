@@ -253,7 +253,7 @@ impl AttestationEngineContract {
         Self::attest(e.clone(), commitment_id.clone(), String::from_str(&e, "drawdown"), data, admin);
 
         // Get updated metrics (which will recalculate from commitment)
-        let metrics = Self::get_health_metrics(e.clone(), commitment_id.clone());
+        let _metrics = Self::get_health_metrics(e.clone(), commitment_id.clone());
 
         // Emit drawdown event
         e.events().publish((symbol_short!("drawdown"), commitment_id), (drawdown_percent, is_compliant));
