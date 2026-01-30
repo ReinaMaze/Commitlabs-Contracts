@@ -1,7 +1,13 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::{Address as _, Ledger};
+use soroban_sdk::testutils::{Address as _, Ledger, Wasm};
+use soroban_sdk::BytesN;
+
+fn upload_wasm(e: &Env) -> BytesN<32> {
+    let wasm = Wasm::from_contract::<PriceOracleContract>();
+    e.deployer().upload_contract_wasm(wasm)
+}
 
 #[test]
 fn test_initialize() {
@@ -17,6 +23,7 @@ fn test_initialize() {
 
     assert_eq!(client.get_admin(), admin);
     assert_eq!(client.get_max_staleness(), 3600);
+    assert_eq!(client.get_version(), CURRENT_VERSION);
 }
 
 #[test]
@@ -211,4 +218,111 @@ fn test_fallback_get_price_returns_default_when_not_set() {
     assert_eq!(data.price, 0);
     assert_eq!(data.updated_at, 0);
     assert_eq!(data.decimals, 0);
+}
+
+#[test]
+fn test_upgrade_and_migrate_preserves_state() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let admin = Address::generate(&e);
+    let oracle = Address::generate(&e);
+    let asset = Address::generate(&e);
+    let contract_id = e.register_contract(None, PriceOracleContract);
+    let client = PriceOracleContractClient::new(&e, &contract_id);
+
+    e.as_contract(&contract_id, || {
+        PriceOracleContract::initialize(e.clone(), admin.clone()).unwrap();
+    });
+
+    client.add_oracle(&admin, &oracle);
+    client.set_price(&oracle, &asset, &2_000, &6);
+
+    // Simulate legacy storage layout (version 0)
+    e.as_contract(&contract_id, || {
+        e.storage().instance().remove(&DataKey::Version);
+        e.storage().instance().remove(&DataKey::OracleConfig);
+        e.storage()
+            .instance()
+            .set(&DataKey::MaxStalenessSeconds, &3000u64);
+    });
+
+    let wasm_hash = upload_wasm(&e);
+    assert_eq!(client.upgrade(&admin, &wasm_hash), Ok(()));
+
+    assert_eq!(client.migrate(&admin, &0), Ok(()));
+    assert_eq!(client.get_version(), CURRENT_VERSION);
+    assert_eq!(client.get_max_staleness(), 3000);
+
+    let data = client.get_price(&asset);
+    assert_eq!(data.price, 2_000);
+    assert_eq!(data.decimals, 6);
+}
+
+#[test]
+fn test_upgrade_authorization_and_invalid_hash() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let admin = Address::generate(&e);
+    let attacker = Address::generate(&e);
+    let contract_id = e.register_contract(None, PriceOracleContract);
+    let client = PriceOracleContractClient::new(&e, &contract_id);
+
+    e.as_contract(&contract_id, || {
+        PriceOracleContract::initialize(e.clone(), admin.clone()).unwrap();
+    });
+
+    let wasm_hash = upload_wasm(&e);
+    assert_eq!(
+        client.upgrade(&attacker, &wasm_hash),
+        Err(OracleError::Unauthorized)
+    );
+
+    let zero = BytesN::from_array(&e, &[0; 32]);
+    assert_eq!(
+        client.upgrade(&admin, &zero),
+        Err(OracleError::InvalidWasmHash)
+    );
+}
+
+#[test]
+fn test_migrate_version_checks_and_replay_safety() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let admin = Address::generate(&e);
+    let attacker = Address::generate(&e);
+    let contract_id = e.register_contract(None, PriceOracleContract);
+    let client = PriceOracleContractClient::new(&e, &contract_id);
+
+    e.as_contract(&contract_id, || {
+        PriceOracleContract::initialize(e.clone(), admin.clone()).unwrap();
+    });
+
+    // Simulate legacy layout (version 0)
+    e.as_contract(&contract_id, || {
+        e.storage().instance().remove(&DataKey::Version);
+        e.storage().instance().remove(&DataKey::OracleConfig);
+        e.storage()
+            .instance()
+            .set(&DataKey::MaxStalenessSeconds, &7200u64);
+    });
+
+    assert_eq!(
+        client.migrate(&attacker, &0),
+        Err(OracleError::Unauthorized)
+    );
+    assert_eq!(
+        client.migrate(&admin, &(CURRENT_VERSION + 1)),
+        Err(OracleError::InvalidVersion)
+    );
+
+    assert_eq!(client.migrate(&admin, &0), Ok(()));
+    assert_eq!(
+        client.migrate(&admin, &0),
+        Err(OracleError::AlreadyMigrated)
+    );
+
+    let legacy_exists = e.as_contract(&contract_id, || {
+        e.storage().instance().has(&DataKey::MaxStalenessSeconds)
+    });
+    assert!(!legacy_exists);
 }

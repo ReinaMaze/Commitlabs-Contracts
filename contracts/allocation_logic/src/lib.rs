@@ -2,10 +2,11 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, Address, Env, Map, Vec, 
-    symbol_short, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Map, Symbol, Vec,
 };
 use shared_utils::RateLimiter;
+
+pub const CURRENT_VERSION: u32 = 1;
 
 // ============================================================================
 // ERROR CODES - Error Handling
@@ -27,6 +28,9 @@ pub enum Error {
     InvalidCapacity = 12,
     ArithmeticOverflow = 13,
     ReentrancyDetected = 14,
+    InvalidWasmHash = 15,
+    InvalidVersion = 16,
+    AlreadyMigrated = 17,
 }
 
 // ============================================================================
@@ -97,6 +101,7 @@ pub enum DataKey {
     PoolRegistry,          // Vec<u32> of all pool IDs
     TotalAllocated(u64),   // Total amount allocated per commitment
     AllocationOwner(u64),  // Track allocation ownership
+    Version,               // Contract version
 }
 
 // ============================================================================
@@ -127,6 +132,7 @@ impl AllocationStrategiesContract {
         env.storage().instance().set(&DataKey::CommitmentCore, &commitment_core);
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::PoolRegistry, &Vec::<u32>::new(&env));
+        env.storage().instance().set(&DataKey::Version, &CURRENT_VERSION);
         
         // Emit initialization event
         env.events().publish(
@@ -549,6 +555,72 @@ impl AllocationStrategiesContract {
         env.storage().instance().get(&DataKey::Initialized).unwrap_or(false)
     }
 
+    /// Get current on-chain version (0 if legacy/uninitialized).
+    pub fn get_version(env: Env) -> u32 {
+        read_version(&env)
+    }
+
+    /// Update admin (admin-only).
+    pub fn set_admin(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_initialized(&env)?;
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Ok(())
+    }
+
+    /// Upgrade contract WASM (admin-only).
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_initialized(&env)?;
+        Self::require_admin(&env, &caller)?;
+        require_valid_wasm_hash(&env, &new_wasm_hash)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    /// Migrate storage from a previous version to CURRENT_VERSION (admin-only).
+    pub fn migrate(
+        env: Env,
+        caller: Address,
+        from_version: u32,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_initialized(&env)?;
+        Self::require_admin(&env, &caller)?;
+
+        let stored_version = read_version(&env);
+        if stored_version == CURRENT_VERSION {
+            return Err(Error::AlreadyMigrated);
+        }
+        if from_version != stored_version || from_version > CURRENT_VERSION {
+            return Err(Error::InvalidVersion);
+        }
+
+        // Ensure registry exists
+        if !env.storage().instance().has(&DataKey::PoolRegistry) {
+            env.storage()
+                .instance()
+                .set(&DataKey::PoolRegistry, &Vec::<u32>::new(&env));
+        }
+        if !env.storage().instance().has(&DataKey::ReentrancyGuard) {
+            env.storage()
+                .instance()
+                .set(&DataKey::ReentrancyGuard, &false);
+        }
+
+        env.storage().instance().set(&DataKey::Version, &CURRENT_VERSION);
+        Ok(())
+    }
+
     // ========================================================================
     // INTERNAL HELPER FUNCTIONS
     // ========================================================================
@@ -763,6 +835,21 @@ impl AllocationStrategiesContract {
 
         Ok(())
     }
+}
+
+fn read_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get::<_, u32>(&DataKey::Version)
+        .unwrap_or(0)
+}
+
+fn require_valid_wasm_hash(env: &Env, wasm_hash: &BytesN<32>) -> Result<(), Error> {
+    let zero = BytesN::from_array(env, &[0; 32]);
+    if *wasm_hash == zero {
+        return Err(Error::InvalidWasmHash);
+    }
+    Ok(())
 }
 
 

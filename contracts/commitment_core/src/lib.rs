@@ -1,10 +1,12 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, token, symbol_short, Address, Env, IntoVal, String,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, log, token, symbol_short, Address, BytesN, Env, IntoVal,
+    String, Symbol, Vec,
 };
 use shared_utils::{SafeMath, TimeUtils, Validation, RateLimiter};
+
+pub const CURRENT_VERSION: u32 = 1;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -72,6 +74,7 @@ pub enum DataKey {
     TotalCommitments,          // counter
     ReentrancyGuard,           // reentrancy protection flag
     TotalValueLocked,          // aggregate value locked across active commitments
+    Version,                   // contract version
 }
 
 /// Transfer assets from owner to contract
@@ -163,6 +166,24 @@ fn require_admin(e: &Env, caller: &Address) {
     }
 }
 
+fn read_version(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get::<_, u32>(&DataKey::Version)
+        .unwrap_or(0)
+}
+
+fn write_version(e: &Env, version: u32) {
+    e.storage().instance().set(&DataKey::Version, &version);
+}
+
+fn require_valid_wasm_hash(e: &Env, wasm_hash: &BytesN<32>) {
+    let zero = BytesN::from_array(e, &[0; 32]);
+    if *wasm_hash == zero {
+        panic!("Invalid wasm hash");
+    }
+}
+
 #[contract]
 pub struct CommitmentCoreContract;
 
@@ -237,6 +258,8 @@ impl CommitmentCoreContract {
         e.storage()
             .instance()
             .set(&DataKey::TotalValueLocked, &0i128);
+
+        write_version(&e, CURRENT_VERSION);
     }
 
     /// Create a new commitment
@@ -813,6 +836,62 @@ impl CommitmentCoreContract {
     pub fn set_rate_limit_exempt(e: Env, caller: Address, address: Address, exempt: bool) {
         require_admin(&e, &caller);
         RateLimiter::set_exempt(&e, &address, exempt);
+    }
+
+    /// Get current on-chain version (0 if legacy/uninitialized).
+    pub fn get_version(e: Env) -> u32 {
+        read_version(&e)
+    }
+
+    /// Update admin address (admin-only).
+    pub fn set_admin(e: Env, caller: Address, new_admin: Address) {
+        require_admin(&e, &caller);
+        e.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
+    /// Upgrade contract WASM (admin-only).
+    pub fn upgrade(e: Env, caller: Address, new_wasm_hash: BytesN<32>) {
+        require_admin(&e, &caller);
+        require_valid_wasm_hash(&e, &new_wasm_hash);
+        e.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    /// Migrate storage from a previous version to CURRENT_VERSION (admin-only).
+    pub fn migrate(e: Env, caller: Address, from_version: u32) {
+        require_admin(&e, &caller);
+
+        let stored_version = read_version(&e);
+        if stored_version == CURRENT_VERSION {
+            panic!("Already migrated");
+        }
+        if from_version != stored_version || from_version > CURRENT_VERSION {
+            panic!("Invalid version");
+        }
+
+        // Ensure required counters are initialized
+        if !e.storage().instance().has(&DataKey::TotalCommitments) {
+            e.storage().instance().set(&DataKey::TotalCommitments, &0u64);
+        }
+        if !e.storage().instance().has(&DataKey::TotalValueLocked) {
+            e.storage().instance().set(&DataKey::TotalValueLocked, &0i128);
+        }
+        if !e.storage().instance().has(&DataKey::ReentrancyGuard) {
+            e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+        }
+
+        // Verify critical state
+        let _admin = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
+        let _nft = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::NftContract)
+            .unwrap_or_else(|| panic!("Contract not initialized"));
+
+        write_version(&e, CURRENT_VERSION);
     }
 }
 
