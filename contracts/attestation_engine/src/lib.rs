@@ -1,8 +1,8 @@
 #![no_std]
 use shared_utils::RateLimiter;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Map, String,
-    Symbol, TryIntoVal, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal,
+    Map, String, Symbol, TryIntoVal, Val, Vec,
 };
 
 pub const CURRENT_VERSION: u32 = 1;
@@ -32,12 +32,12 @@ pub enum AttestationError {
     CommitmentNotFound = 7,
     /// Storage operation failed
     StorageError = 8,
-    /// Invalid WASM hash
-    InvalidWasmHash = 9,
-    /// Invalid version
-    InvalidVersion = 10,
-    /// Migration already applied
-    AlreadyMigrated = 11,
+    /// Invalid fee amount (must be non-negative)
+    InvalidFeeAmount = 9,
+    /// Fee recipient not set; cannot withdraw
+    FeeRecipientNotSet = 10,
+    /// Insufficient collected fees to withdraw
+    InsufficientFees = 11,
 }
 
 // ============================================================================
@@ -69,8 +69,14 @@ pub enum DataKey {
     TotalFees,
     /// Per-verifier analytics: attestation count by verifier
     VerifierAttestationCount(Address),
-    /// Contract version
-    Version,
+    /// Fee collection: protocol treasury for withdrawals
+    FeeRecipient,
+    /// Attestation verification fee: amount per attestation (0 = no fee)
+    AttestationFeeAmount,
+    /// Attestation verification fee: token address (when amount > 0)
+    AttestationFeeAsset,
+    /// Collected fees per asset (asset -> i128)
+    CollectedFees(Address),
 }
 
 #[contracttype]
@@ -653,6 +659,19 @@ impl AttestationEngineContract {
         if !Self::validate_attestation_data(&e, &attestation_type, &data) {
             e.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(AttestationError::InvalidAttestationData);
+        }
+
+        // 7b. Collect attestation verification fee if configured
+        let fee_amount: i128 = e.storage().instance().get(&DataKey::AttestationFeeAmount).unwrap_or(0);
+        if fee_amount > 0 {
+            if let Some(fee_asset) = e.storage().instance().get::<DataKey, Address>(&DataKey::AttestationFeeAsset) {
+                let contract_address = e.current_contract_address();
+                let token_client = token::Client::new(&e, &fee_asset);
+                token_client.transfer(&caller, &contract_address, &fee_amount);
+                let key = DataKey::CollectedFees(fee_asset.clone());
+                let current: i128 = e.storage().instance().get(&key).unwrap_or(0);
+                e.storage().instance().set(&key, &(current + fee_amount));
+            }
         }
 
         // 8. Create attestation record
@@ -1616,6 +1635,118 @@ impl AttestationEngineContract {
 
         RateLimiter::set_exempt(&e, &verifier, exempt);
         Ok(())
+    }
+
+    // ========================================================================
+    // Fee collection (protocol revenue)
+    // ========================================================================
+
+    /// Set attestation verification fee: amount per attestation and token. Admin only.
+    /// Set amount to 0 to disable.
+    pub fn set_attestation_fee(
+        e: Env,
+        caller: Address,
+        amount: i128,
+        asset: Address,
+    ) -> Result<(), AttestationError> {
+        caller.require_auth();
+        let admin: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AttestationError::NotInitialized)?;
+        if caller != admin {
+            return Err(AttestationError::Unauthorized);
+        }
+        if amount < 0 {
+            return Err(AttestationError::InvalidFeeAmount);
+        }
+        e.storage().instance().set(&DataKey::AttestationFeeAmount, &amount);
+        e.storage().instance().set(&DataKey::AttestationFeeAsset, &asset);
+        e.events().publish(
+            (Symbol::new(&e, "AttestationFeeSet"), caller),
+            (amount, asset, e.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    /// Set fee recipient (protocol treasury). Admin only.
+    pub fn set_fee_recipient(e: Env, caller: Address, recipient: Address) -> Result<(), AttestationError> {
+        caller.require_auth();
+        let admin: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AttestationError::NotInitialized)?;
+        if caller != admin {
+            return Err(AttestationError::Unauthorized);
+        }
+        e.storage().instance().set(&DataKey::FeeRecipient, &recipient);
+        e.events().publish(
+            (Symbol::new(&e, "FeeRecipientSet"), caller),
+            (recipient, e.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    /// Withdraw collected fees to the configured fee recipient. Admin only.
+    pub fn withdraw_fees(
+        e: Env,
+        caller: Address,
+        asset_address: Address,
+        amount: i128,
+    ) -> Result<(), AttestationError> {
+        caller.require_auth();
+        let admin: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AttestationError::NotInitialized)?;
+        if caller != admin {
+            return Err(AttestationError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(AttestationError::InvalidFeeAmount);
+        }
+        let recipient: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::FeeRecipient)
+            .ok_or(AttestationError::FeeRecipientNotSet)?;
+        let key = DataKey::CollectedFees(asset_address.clone());
+        let collected: i128 = e.storage().instance().get(&key).unwrap_or(0);
+        if amount > collected {
+            return Err(AttestationError::InsufficientFees);
+        }
+        e.storage().instance().set(&key, &(collected - amount));
+        let contract_address = e.current_contract_address();
+        let token_client = token::Client::new(&e, &asset_address);
+        token_client.transfer(&contract_address, &recipient, &amount);
+        e.events().publish(
+            (Symbol::new(&e, "FeesWithdrawn"), caller, recipient),
+            (asset_address, amount, e.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    /// Get attestation fee (amount, asset). (0, default) if not set.
+    pub fn get_attestation_fee(e: Env) -> (i128, Option<Address>) {
+        let amount: i128 = e.storage().instance().get(&DataKey::AttestationFeeAmount).unwrap_or(0);
+        let asset: Option<Address> = e.storage().instance().get(&DataKey::AttestationFeeAsset);
+        (amount, asset)
+    }
+
+    /// Get fee recipient. None if not set.
+    pub fn get_fee_recipient(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::FeeRecipient)
+    }
+
+    /// Get collected fees for an asset.
+    pub fn get_collected_fees(e: Env, asset_address: Address) -> i128 {
+        e.storage()
+            .instance()
+            .get(&DataKey::CollectedFees(asset_address))
+            .unwrap_or(0)
     }
 }
 
